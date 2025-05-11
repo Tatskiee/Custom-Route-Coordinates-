@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Custom Route Creator with Pinpoint, Live Tracking, Undo, and Curve Modes</title>
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" 
+          integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" 
+          crossorigin=""/>
+    <!-- Leaflet JavaScript -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" 
+            integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" 
+            crossorigin=""></script>
+    <!-- html2canvas for map screenshot -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            display: flex;
+        }
+        #map {
+            height: 100vh;
+            width: 75%;
+        }
+        #map.pinpoint-mode {
+            cursor: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><path d="M16 0v32M0 16h32" stroke="black" stroke-width="2"/></svg>') 16 16, crosshair;
+        }
+        #sidebar {
+            width: 25%;
+            padding: 20px;
+            background-color: #f4f4f4;
+            overflow-y: auto;
+            height: 100vh;
+            box-sizing: border-box;
+        }
+        #coordinates {
+            margin-top: 20px;
+        }
+        #coordinates p {
+            margin: 5px 0;
+            font-size: 14px;
+        }
+        #download-btn, #track-btn, #include-tracked-btn, #pinpoint-btn, #undo-btn {
+            margin-top: 10px;
+            padding: 10px 20px;
+            color: white;
+            border: none;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        #download-btn {
+            background-color: #28a745;
+        }
+        #download-btn:hover {
+            background-color: #218838;
+        }
+        #track-btn {
+            background-color: #007bff;
+        }
+        #track-btn:hover {
+            background-color: #0056b3;
+        }
+        #track-btn.tracking {
+            background-color: #dc3545;
+        }
+        #track-btn.tracking:hover {
+            background-color: #c82333;
+        }
+        #include-tracked-btn {
+            background-color: #6c757d;
+        }
+        #include-tracked-btn:hover {
+            background-color: #5a6268;
+        }
+        #include-tracked-btn.active {
+            background-color: #17a2b8;
+        }
+        #pinpoint-btn {
+            background-color: #ffc107;
+        }
+        #pinpoint-btn:hover {
+            background-color: #e0a800;
+        }
+        #pinpoint-btn.active {
+            background-color: #fd7e14;
+        }
+        #undo-btn {
+            background-color: #6c757d;
+        }
+        #undo-btn:hover {
+            background-color: #5a6268;
+        }
+        #undo-btn:disabled {
+            background-color: #adb5bd;
+            cursor: not-allowed;
+        }
+        #curve-offset {
+            margin-top: 10px;
+            padding: 5px;
+            width: 100px;
+        }
+        #curve-status {
+            margin-top: 10px;
+            font-size: 14px;
+            color: #333;
+        }
+        #preview {
+            margin-top: 20px;
+            max-width: 100%;
+        }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <div id="sidebar">
+        <h2>Route Coordinates</h2>
+        <button id="pinpoint-btn">Enable Pinpoint Mode</button>
+        <button id="track-btn">Start Live Tracking</button>
+        <button id="include-tracked-btn">Include Tracked Points</button>
+        <button id="undo-btn" disabled>Undo Last Point</button>
+        <label for="curve-offset">Curve Offset (pixels):</label>
+        <input type="number" id="curve-offset" value="50" min="0" max="200">
+        <div id="curve-status">Next point: Straight</div>
+        <div id="coordinates"></div>
+        <button id="download-btn">Download Route Preview</button>
+        <div id="preview"></div>
+    </div>
+    <script>
+        // Initialize the map
+        const map = L.map('map').setView([51.505, -0.09], 13);
+
+        // Add OpenStreetMap tile layer
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }).addTo(map);
+
+        // Arrays and variables for route and tracking
+        let routePoints = [];
+        let markers = [];
+        let polyline = null;
+        let liveMarker = null;
+        let previewLine = null;
+        let watchId = null;
+        let isTracking = false;
+        let includeTrackedPoints = false;
+        let isPinpointMode = false;
+        let nextPointType = 'straight';
+
+        // Function to update curve status display
+        function updateCurveStatus() {
+            const statusText = nextPointType === 'straight' ? 'Straight' : nextPointType.replace('_', ' ');
+            document.getElementById('curve-status').textContent = `Next point: ${statusText}`;
+        }
+
+        // Initialize curve status
+        updateCurveStatus();
+
+        // Function to calculate quadratic Bezier curve points with pixel offsets
+        function getQuadraticBezierPoints(p0, p2, direction, map, offset_pixels) {
+            const p0_pix = map.latLngToContainerPoint(p0);
+            const p2_pix = map.latLngToContainerPoint(p2);
+            const dx_pix = p2_pix.x - p0_pix.x;
+            const dy_pix = p2_pix.y - p0_pix.y;
+            const len = Math.sqrt(dx_pix * dx_pix + dy_pix * dy_pix);
+            if (len === 0) return [[p0.lat, p0.lng], [p2.lat, p2.lng]];
+            let perp_x, perp_y;
+            if (direction === 'left') {
+                perp_x = -dy_pix / len;
+                perp_y = dx_pix / len;
+            } else if (direction === 'right') {
+                perp_x = dy_pix / len;
+                perp_y = -dx_pix / len;
+            } else {
+                perp_x = 0;
+                perp_y = 0;
+            }
+            const mid_pix_x = (p0_pix.x + p2_pix.x) / 2;
+            const mid_pix_y = (p0_pix.y + p2_pix.y) / 2;
+            const control_pix_x = mid_pix_x + offset_pixels * perp_x;
+            const control_pix_y = mid_pix_y + offset_pixels * perp_y;
+            const control_latlng = map.containerPointToLatLng([control_pix_x, control_pix_y]);
+            const points = [];
+            for (let t = 0; t <= 1; t += 0.01) {
+                const t1 = 1 - t;
+                const lat = t1 * t1 * p0.lat + 2 * t1 * t * control_latlng.lat + t * t * p2.lat;
+                const lng = t1 * t1 * p0.lng + 2 * t1 * t * control_latlng.lng + t * t * p2.lng;
+                points.push([lat, lng]);
+            }
+            return points;
+        }
+
+        // Function to update the route
+        function updateRoute() {
+            if (polyline) map.removeLayer(polyline);
+            const segments = [];
+            for (let i = 0; i < routePoints.length - 1; i++) {
+                if (routePoints[i + 1].isCurve) {
+                    const direction = routePoints[i + 1].curveDirection;
+                    const offset = routePoints[i + 1].curveOffset;
+                    segments.push(getQuadraticBezierPoints(routePoints[i], routePoints[i + 1], direction, map, offset));
+                } else {
+                    segments.push([routePoints[i], routePoints[i + 1]]);
+                }
+            }
+            if (segments.length > 0) {
+                polyline = L.polyline(segments.flat(), {
+                    color: 'blue',
+                    weight: 5,
+                    opacity: 0.7
+                }).addTo(map);
+            }
+            const coordsDiv = document.getElementById('coordinates');
+            coordsDiv.innerHTML = routePoints.length > 0 
+                ? routePoints.map((point, index) => 
+                    `<p>Point ${index + 1}: (${point.lat.toFixed(6)}, ${point.lng.toFixed(6)})${point.isCurve ? ` [Curve ${point.curveDirection}, Offset: ${point.curveOffset}px]` : ''}</p>`
+                  ).join('')
+                : '<p>No points added yet.</p>';
+            document.getElementById('undo-btn').disabled = routePoints.length === 0;
+            updatePreviewLine();
+        }
+
+        // Function to update the preview line
+        function updatePreviewLine(cursorLatlng = null) {
+            if (previewLine) map.removeLayer(previewLine);
+            previewLine = null;
+            if (isPinpointMode && routePoints.length > 0 && cursorLatlng) {
+                let linePoints;
+                if (nextPointType === 'left_curve' || nextPointType === 'right_curve') {
+                    const direction = nextPointType === 'left_curve' ? 'left' : 'right';
+                    const offset = parseInt(document.getElementById('curve-offset').value);
+                    linePoints = getQuadraticBezierPoints(routePoints[routePoints.length - 1], cursorLatlng, direction, map, offset);
+                } else {
+                    linePoints = [routePoints[routePoints.length - 1], cursorLatlng];
+                }
+                previewLine = L.polyline(linePoints, {
+                    color: 'blue',
+                    weight: 5,
+                    opacity: 0.7,
+                    dashArray: '5, 10'
+                }).addTo(map);
+            }
+        }
+
+        // Handle map click to add points in pinpoint mode
+        map.on('click', function(e) {
+            if (!isPinpointMode) return;
+            const latlng = e.latlng;
+            let point = { lat: latlng.lat, lng: latlng.lng };
+            if (nextPointType === 'left_curve') {
+                point.isCurve = true;
+                point.curveDirection = 'left';
+                point.curveOffset = parseInt(document.getElementById('curve-offset').value);
+            } else if (nextPointType === 'right_curve') {
+                point.isCurve = true;
+                point.curveDirection = 'right';
+                point.curveOffset = parseInt(document.getElementById('curve-offset').value);
+            } else {
+                point.isCurve = false;
+            }
+            routePoints.push(point);
+            const marker = L.marker(latlng).addTo(map);
+            markers.push(marker);
+            nextPointType = 'straight';
+            updateCurveStatus();
+            updateRoute();
+        });
+
+        // Handle mouse move to show preview line
+        map.on('mousemove', function(e) {
+            if (isPinpointMode && routePoints.length > 0) {
+                updatePreviewLine(e.latlng);
+            }
+        });
+
+        // Function to capture map screenshot
+        function captureMap() {
+            html2canvas(document.getElementById('map')).then(canvas => {
+                const img = document.createElement('img');
+                img.src = canvas.toDataURL('image/png');
+                img.style.maxWidth = '100%';
+                const previewDiv = document.getElementById('preview');
+                previewDiv.innerHTML = '';
+                previewDiv.appendChild(img);
+                const downloadBtn = document.getElementById('download-btn');
+                downloadBtn.onclick = function() {
+                    const link = document.createElement('a');
+                    link.download = 'route-preview.png';
+                    link.href = canvas.toDataURL('image/png');
+                    link.click();
+                };
+            });
+        }
+
+        // Undo last point
+        function undoLastPoint() {
+            if (routePoints.length > 0) {
+                routePoints.pop();
+                const lastMarker = markers.pop();
+                if (lastMarker) map.removeLayer(lastMarker);
+                updateRoute();
+            }
+        }
+
+        // Live tracking functionality
+        function startTracking() {
+            if (navigator.geolocation) {
+                isTracking = true;
+                trackBtn.textContent = 'Stop Live Tracking';
+                trackBtn.classList.add('tracking');
+                watchId = navigator.geolocation.watchPosition(
+                    (position) => {
+                        const lat = position.coords.latitude;
+                        const lng = position.coords.longitude;
+                        const latlng = L.latLng(lat, lng);
+                        if (liveMarker) {
+                            liveMarker.setLatLng(latlng);
+                        } else {
+                            liveMarker = L.circleMarker(latlng, {
+                                radius: 8,
+                                fillColor: '#ff0000',
+                                color: '#ff0000',
+                                weight: 1,
+                                opacity: 1,
+                                fillOpacity: 0.8
+                            }).addTo(map);
+                        }
+                        map.setView(latlng, map.getZoom());
+                        if (includeTrackedPoints) {
+                            routePoints.push({ lat: latlng.lat, lng: latlng.lng, isCurve: false });
+                            updateRoute();
+                        }
+                    },
+                    (error) => {
+                        console.error('Geolocation error:', error);
+                        alert('Unable to access location. Please ensure location services are enabled.');
+                        stopTracking();
+                    },
+                    {
+                        enableHighAccuracy: true,
+                        timeout: 5000,
+                        maximumAge: 0
+                    }
+                );
+            } else {
+                alert('Geolocation is not supported by this browser.');
+            }
+        }
+
+        function stopTracking() {
+            if (watchId !== null) {
+                navigator.geolocation.clearWatch(watchId);
+                watchId = null;
+            }
+            if (liveMarker) {
+                map.removeLayer(liveMarker);
+                liveMarker = null;
+            }
+            isTracking = false;
+            trackBtn.textContent = 'Start Live Tracking';
+            trackBtn.classList.remove('tracking');
+        }
+
+        // Event listeners
+        const trackBtn = document.getElementById('track-btn');
+        const includeTrackedBtn = document.getElementById('include-tracked-btn');
+        const pinpointBtn = document.getElementById('pinpoint-btn');
+        const undoBtn = document.getElementById('undo-btn');
+
+        trackBtn.addEventListener('click', () => {
+            if (isTracking) stopTracking();
+            else startTracking();
+        });
+
+        includeTrackedBtn.addEventListener('click', () => {
+            includeTrackedPoints = !includeTrackedPoints;
+            includeTrackedBtn.classList.toggle('active', includeTrackedPoints);
+        });
+
+        pinpointBtn.addEventListener('click', () => {
+            isPinpointMode = !isPinpointMode;
+            pinpointBtn.classList.toggle('active', isPinpointMode);
+            pinpointBtn.textContent = isPinpointMode ? 'Disable Pinpoint Mode' : 'Enable Pinpoint Mode';
+            map.getContainer().classList.toggle('pinpoint-mode', isPinpointMode);
+            if (!isPinpointMode) updatePreviewLine();
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'x') {
+                nextPointType = 'left_curve';
+                updateCurveStatus();
+                e.preventDefault();
+            } else if (e.key === 'c') {
+                nextPointType = 'right_curve';
+                updateCurveStatus();
+                e.preventDefault();
+            }
+        });
+
+        undoBtn.addEventListener('click', undoLastPoint);
+
+        document.getElementById('download-btn').addEventListener('click', captureMap);
+
+        document.getElementById('curve-offset').addEventListener('input', (e) => {
+            if (isPinpointMode && routePoints.length > 0) {
+                updatePreviewLine(previewLine ? previewLine.getLatLngs()[previewLine.getLatLngs().length - 1] : null);
+            }
+        });
+
+        captureMap();
+    </script>
+</body>
+</html>
